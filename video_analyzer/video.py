@@ -1,148 +1,85 @@
-"""Video metadata extraction via ffprobe."""
+"""
+video_analyzer.py - Print basic metadata for a video file.
 
-from __future__ import annotations
+Usage: python video_analyzer.py <path-to-video>
+Requires: ffprobe (part of ffmpeg) installed and on PATH.
+"""
 
 import json
-import shutil
+import os
 import subprocess
-from pathlib import Path
-from typing import Any
+import sys
 
-from core.utils import MediaInspectorError, detect_mime_type, format_duration, human_size
+path = sys.argv[1] if len(sys.argv) > 1 else input("Video path: ")
 
+if not os.path.isfile(path):
+    print(f"Error: file not found: {path}")
+    sys.exit(1)
 
-class VideoParser:
-    """Extract container, duration, and video/audio stream details."""
+try:
+    result = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-print_format", "json",
+         "-show_format", "-show_streams", path],
+        capture_output=True, text=True
+    )
+except FileNotFoundError:
+    print("Error: ffprobe not found. Install ffmpeg and make sure it's on your PATH.")
+    sys.exit(1)
 
-    def analyze(self, path: Path) -> dict[str, Any]:
-        payload = self._run_ffprobe(path)
-        fmt = payload.get("format") or {}
-        streams = payload.get("streams") or []
+if result.returncode != 0:
+    print(f"Error: ffprobe could not read '{path}'. Is it a valid video file?")
+    sys.exit(1)
 
-        video_stream = next((s for s in streams if s.get("codec_type") == "video"), None)
-        audio_stream = next((s for s in streams if s.get("codec_type") == "audio"), None)
+try:
+    data = json.loads(result.stdout)
+except json.JSONDecodeError:
+    print("Error: could not parse ffprobe output.")
+    sys.exit(1)
 
-        duration = self._to_float(fmt.get("duration"))
-        if duration is None and video_stream:
-            duration = self._to_float(video_stream.get("duration"))
+fmt = data.get("format", {})
+streams = data.get("streams", [])
+video = next((s for s in streams if s.get("codec_type") == "video"), {})
+audio = next((s for s in streams if s.get("codec_type") == "audio"), {})
 
-        return {
-            "kind": "video",
-            "file": {
-                "path": str(path),
-                "name": path.name,
-                "size_bytes": path.stat().st_size,
-                "size_human": human_size(path.stat().st_size),
-                "mime_type": detect_mime_type(path),
-            },
-            "container": {
-                "format_name": fmt.get("format_name"),
-                "format_long_name": fmt.get("format_long_name"),
-                "bit_rate_bps": self._to_int(fmt.get("bit_rate")),
-            },
-            "duration_seconds": duration,
-            "duration": format_duration(duration),
-            "video_stream": self._video_details(video_stream) if video_stream else None,
-            "audio_stream": self._audio_details(audio_stream) if audio_stream else None,
-            "stream_count": len(streams),
-        }
+if not video:
+    print("Warning: no video stream found in this file.\n")
 
-    def _run_ffprobe(self, path: Path) -> dict[str, Any]:
-        ffprobe = shutil.which("ffprobe")
-        if not ffprobe:
-            raise MediaInspectorError(
-                "FFmpeg/ffprobe was not found on PATH. Install FFmpeg and try again. "
-                "See README.md for install instructions."
-            )
+print("================================")
+print("VIDEO METADATA REPORT")
+print("================================")
+print(f"File Name       : {os.path.basename(path)}")
+print(f"File Size       : {os.path.getsize(path)} bytes")
+print(f"File Format     : {fmt.get('format_long_name', 'N/A')}")
 
-        command = [
-            ffprobe,
-            "-v",
-            "error",
-            "-print_format",
-            "json",
-            "-show_format",
-            "-show_streams",
-            str(path),
-        ]
-        try:
-            completed = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-        except OSError as exc:
-            raise MediaInspectorError(f"Failed to run ffprobe: {exc}") from exc
+try:
+    duration = f"{float(fmt.get('duration', 0)):.2f} sec"
+except (TypeError, ValueError):
+    duration = "N/A"
+print(f"Duration        : {duration}")
+print(f"Bit Rate        : {fmt.get('bit_rate', 'N/A')} bps")
 
-        if completed.returncode != 0:
-            stderr = (completed.stderr or "").strip() or "unknown ffprobe error"
-            raise MediaInspectorError(
-                f"Could not analyze video '{path.name}'. The file may be corrupted. ({stderr})"
-            )
+print("\nVideo Stream")
+print("-------------------------------")
+if video:
+    print(f"Codec           : {video.get('codec_long_name', 'N/A')}")
+    print(f"Resolution      : {video.get('width', '?')}x{video.get('height', '?')}")
+    print(f"Frame Rate      : {video.get('r_frame_rate', 'N/A')}")
+    print(f"Pixel Format    : {video.get('pix_fmt', 'N/A')}")
+else:
+    print("No video stream found.")
 
-        try:
-            data = json.loads(completed.stdout or "{}")
-        except json.JSONDecodeError as exc:
-            raise MediaInspectorError("ffprobe returned invalid JSON.") from exc
+print("\nAudio Stream")
+print("-------------------------------")
+if audio:
+    print(f"Codec           : {audio.get('codec_long_name', 'N/A')}")
+    print(f"Sample Rate     : {audio.get('sample_rate', 'N/A')} Hz")
+    print(f"Channels        : {audio.get('channels', 'N/A')}")
+else:
+    print("No audio stream found.")
 
-        if not data.get("format") and not data.get("streams"):
-            raise MediaInspectorError(
-                f"No streams found in '{path.name}'. The file may be corrupted or not a video."
-            )
-        return data
-
-    def _video_details(self, stream: dict[str, Any]) -> dict[str, Any]:
-        width = stream.get("width")
-        height = stream.get("height")
-        fps = self._parse_rate(stream.get("avg_frame_rate") or stream.get("r_frame_rate"))
-        return {
-            "codec": stream.get("codec_name"),
-            "codec_long_name": stream.get("codec_long_name"),
-            "profile": stream.get("profile"),
-            "width": width,
-            "height": height,
-            "resolution": f"{width}x{height}" if width and height else None,
-            "fps": fps,
-            "pixel_format": stream.get("pix_fmt"),
-            "bit_rate_bps": self._to_int(stream.get("bit_rate")),
-        }
-
-    def _audio_details(self, stream: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "codec": stream.get("codec_name"),
-            "codec_long_name": stream.get("codec_long_name"),
-            "channels": stream.get("channels"),
-            "channel_layout": stream.get("channel_layout"),
-            "sample_rate_hz": self._to_int(stream.get("sample_rate")),
-            "bit_rate_bps": self._to_int(stream.get("bit_rate")),
-        }
-
-    @staticmethod
-    def _parse_rate(value: str | None) -> float | None:
-        if not value or value in {"0/0", "N/A"}:
-            return None
-        try:
-            if "/" in value:
-                num, den = value.split("/", 1)
-                denominator = float(den)
-                if denominator == 0:
-                    return None
-                return round(float(num) / denominator, 3)
-            return round(float(value), 3)
-        except (TypeError, ValueError):
-            return None
-
-    @staticmethod
-    def _to_float(value: Any) -> float | None:
-        try:
-            return float(value) if value is not None else None
-        except (TypeError, ValueError):
-            return None
-
-    @staticmethod
-    def _to_int(value: Any) -> int | None:
-        try:
-            return int(float(value)) if value is not None else None
-        except (TypeError, ValueError):
-            return None
+tags = fmt.get("tags", {})
+if tags:
+    print("\nTags")
+    print("-------------------------------")
+    for k, v in tags.items():
+        print(f"{k:<16}: {v}")
